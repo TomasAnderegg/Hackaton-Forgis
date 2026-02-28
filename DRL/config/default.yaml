@@ -1,0 +1,53 @@
+delta: 0.02
+travel_height: 0.30
+pick_height: 0.12
+drop_height: 0.22
+num_objects: 5
+num_obstacles: 1
+dynamic_obstacles: false
+dynamic_obstacle_flip_prob: 0.10
+max_steps: 300
+k_nearest_obstacles: 3
+grasp_radius: 0.03
+drop_radius: 0.04
+step_cost: -0.1
+placed_reward: 10.0
+all_placed_bonus: 50.0
+grasp_success_reward: 1.0
+dropped_penalty: -10.0
+error_penalty: -10.0
+rescan_cost: -0.5
+mode_switch_penalty: -0.05
+miss_detection_prob: 0.10
+detection_noise_std: 0.015
+unsafe_action_behavior: NOOP
+baseline_missing_before_rescan: 3
+bandit_alpha: 0.7
+reward_scale: 10.0
+sim_eval_episodes: 50
+tool_orientation: [3.14159, 0.0, 0.0]
+workspace:
+  x_min: 0.00
+  x_max: 0.60
+  y_min: -0.30
+  y_max: 0.30
+  z_min: 0.05
+  z_max: 0.40
+obstacle_margin:
+  safe: 0.03
+  fast: 0.015
+grasp_fail_prob:
+  safe: 0.05
+  fast: 0.20
+shaping:
+  k1: 0.8
+  k2: 0.6
+speeds:
+  safe:
+    acceleration: 0.6
+    velocity: 0.20
+  fast:
+    acceleration: 1.2
+    velocity: 0.40
+gripper:
+  pin: 0
