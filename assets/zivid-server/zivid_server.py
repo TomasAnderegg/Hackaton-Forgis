@@ -45,9 +45,15 @@ class ZividCapture:
 
             if self.ip:
                 logger.info(f"Connecting to Zivid camera at IP {self.ip}...")
-                self._camera = self._app.connect_camera(
-                    zivid.CameraInfo.Network.IPAddress(self.ip)
-                )
+                # Try different SDK versions' IP-connect APIs
+                try:
+                    self._camera = self._app.connect_camera(
+                        zivid.CameraInfo.Network.IPAddress(self.ip)
+                    )
+                except AttributeError:
+                    self._camera = self._app.connect_camera(
+                        zivid.NetworkCamera(self.ip)
+                    )
             else:
                 cameras = self._app.cameras()
                 if not cameras:
@@ -66,13 +72,15 @@ class ZividCapture:
                 f"(serial {self._camera.info.serial_number})"
             )
 
-            # Basic 2D capture settings (fast, for streaming)
+            # 2D capture settings for indoor/warehouse lighting.
+            # Zivid 2+ MR130: exposure_time in [900, 20000] μs, brightness>=1.0 required for color RGB.
+            # aperture=2.83 (widest), exposure=20ms (max), gain=8, projector on.
             self._settings = zivid.Settings2D(
                 acquisitions=[zivid.Settings2D.Acquisition(
-                    aperture=5.66,
-                    exposure_time=datetime.timedelta(microseconds=8333),
+                    aperture=2.83,
+                    exposure_time=datetime.timedelta(microseconds=10000),
                     brightness=1.0,
-                    gain=1.0,
+                    gain=6.0,
                 )]
             )
             return True
