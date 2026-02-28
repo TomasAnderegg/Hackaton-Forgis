@@ -14,6 +14,7 @@ from flow.manager import FlowManager
 from nodes.ur_node import RobotNode
 from nodes.dobot_nova5_node import DobotNova5Node
 from nodes.camera_node import CameraNode
+from nodes.zivid_node import ZividNode
 from nodes.camera_bridge_node import CameraBridgeNode
 from nodes.covvi_hand_node import CovviHandNode
 # Import skills to register them
@@ -57,8 +58,15 @@ def main():
         io_robot_executor = IOExecutor(robot, executor_type="io_robot")
         logger.info("Using UR robot")
 
-    # Fixed ROS 2 nodes
-    camera = CameraNode()
+    # Select camera type from environment (realsense | zivid)
+    camera_type = os.environ.get("CAMERA_TYPE", "realsense").lower()
+    if camera_type == "zivid":
+        camera = ZividNode()
+        logger.info("Using Zivid camera")
+    else:
+        camera = CameraNode()
+        logger.info("Using RealSense camera")
+
     camera_bridge = CameraBridgeNode()
     hand = CovviHandNode()
 

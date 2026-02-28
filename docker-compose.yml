@@ -31,6 +31,23 @@ services:
     restart: unless-stopped
 
 
+  # ── Zivid Camera Driver ───────────────────────────────────────
+  # Enable with: docker compose --profile zivid up
+  # Or set COMPOSE_PROFILES=zivid in .env
+  zivid-driver:
+    profiles: [zivid]
+    build: ./assets/zivid-driver
+    container_name: zivid-driver
+    network_mode: host
+    ipc: host
+    privileged: true          # Required for USB access to Zivid camera
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+    env_file: .env
+    command: bash scripts/start_driver.sh
+    restart: unless-stopped
+
+
   # ── Backend Application ──────────────────────────────────────
   # Runs RobotNode + PickAndPlacePipeline + FastAPI flow execution API.
   # API available at http://localhost:8000
