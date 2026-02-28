@@ -1,27 +1,31 @@
-"""ROS 2 node for Zivid camera subscription (color + point cloud)."""
+"""ROS 2 node that receives Zivid frames from the Windows zivid_server.py via WebSocket."""
 
+import asyncio
+import logging
+import os
 import threading
 from typing import Optional
-
-import struct
 
 import cv2
 import numpy as np
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import Image, PointCloud2
+
+logger = logging.getLogger(__name__)
+
+MAX_QUEUE_SIZE = 1  # Always use freshest frame
 
 
 class ZividNode(Node):
     """
-    ROS 2 node that subscribes to Zivid camera topics.
+    ROS 2 node that connects to the native Windows zivid_server.py
+    and caches color frames for use by CameraExecutor.
 
-    Stores the latest color frame, JPEG cache, and point cloud
-    in a thread-safe manner for access by the executor.
+    The zivid_server.py runs on Windows (with the Zivid SDK installed),
+    captures frames, and streams them as JPEG over WebSocket.
+    This node connects to that WebSocket and decodes the frames.
 
-    Topics (published by zivid_ros driver):
-      /zivid_camera/color/image_color   — RGB color image
-      /zivid_camera/depth/points        — PointCloud2 (XYZ + RGB)
+    Start the server manually on Windows:
+        cd assets/zivid-server && python zivid_server.py --port 8766
     """
 
     def __init__(self):
@@ -29,109 +33,123 @@ class ZividNode(Node):
 
         self._frame: Optional[np.ndarray] = None
         self._frame_jpeg: Optional[bytes] = None
-        self._point_cloud: Optional[np.ndarray] = None  # Nx6: X,Y,Z,R,G,B
         self._frame_lock = threading.Lock()
-        self._pc_lock = threading.Lock()
         self._recv_count = 0
 
-        # Zivid publishes with RELIABLE QoS
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
+        # WebSocket server address (zivid_server.py on Windows host)
+        self.ws_host = os.environ.get("CAMERA_BRIDGE_HOST", "host.docker.internal")
+        self.ws_port = int(os.environ.get("ZIVID_SERVER_PORT", "8766"))
+        self.ws_uri = f"ws://{self.ws_host}:{self.ws_port}"
 
-        self.create_subscription(
-            Image,
-            "/zivid_camera/color/image_color",
-            self._on_image,
-            qos,
-        )
+        self._connected = False
+        self._reconnect_delay = 2.0
+        self._running = True
+        self._frame_queue: Optional[asyncio.Queue] = None
 
-        self.create_subscription(
-            PointCloud2,
-            "/zivid_camera/depth/points",
-            self._on_point_cloud,
-            qos,
-        )
+        # Start WebSocket client in background thread
+        self._ws_thread = threading.Thread(target=self._run_ws_client, daemon=True)
+        self._ws_thread.start()
 
         self.get_logger().info(
-            "ZividNode initialized — waiting for /zivid_camera/color/image_color"
+            f"ZividNode initialized — connecting to {self.ws_uri}"
         )
 
     # ------------------------------------------------------------------
-    # Callbacks
+    # WebSocket client (mirrors CameraBridgeNode pattern)
     # ------------------------------------------------------------------
 
-    def _on_image(self, msg: Image) -> None:
-        """Convert ROS Image (rgb8) to OpenCV BGR numpy array and cache JPEG."""
-        if msg.encoding not in ("rgb8", "RGB8"):
-            self.get_logger().warn(
-                f"Unexpected encoding: {msg.encoding}", throttle_duration_sec=5.0
-            )
+    def _run_ws_client(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._ws_client_loop())
+        except Exception as e:
+            self.get_logger().error(f"WebSocket client loop error: {e}")
+        finally:
+            loop.close()
+
+    async def _ws_client_loop(self) -> None:
+        try:
+            import websockets
+        except ImportError:
+            self.get_logger().error("websockets package not installed")
             return
 
-        frame_rgb = np.frombuffer(msg.data, dtype=np.uint8).reshape(
-            (msg.height, msg.width, 3)
-        )
-        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        while self._running:
+            try:
+                self.get_logger().info(f"Connecting to Zivid server at {self.ws_uri}")
+                async with websockets.connect(self.ws_uri) as websocket:
+                    self._connected = True
+                    self.get_logger().info("Connected to Zivid server")
 
-        success, jpeg_data = cv2.imencode(
-            ".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70]
-        )
+                    self._frame_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+                    processor_task = asyncio.create_task(self._process_loop())
+
+                    try:
+                        async for message in websocket:
+                            if not self._running:
+                                break
+                            if self._frame_queue.full():
+                                try:
+                                    self._frame_queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    pass
+                            try:
+                                self._frame_queue.put_nowait(message)
+                            except asyncio.QueueFull:
+                                pass
+                    finally:
+                        processor_task.cancel()
+                        try:
+                            await processor_task
+                        except asyncio.CancelledError:
+                            pass
+
+            except Exception as e:
+                self.get_logger().warn(
+                    f"Zivid server not available ({e})", throttle_duration_sec=10.0
+                )
+            finally:
+                self._connected = False
+                self._frame_queue = None
+
+            if self._running:
+                await asyncio.sleep(self._reconnect_delay)
+
+    async def _process_loop(self) -> None:
+        while self._running and self._frame_queue:
+            try:
+                jpeg_data = await asyncio.wait_for(
+                    self._frame_queue.get(), timeout=0.5
+                )
+                self._decode_frame(jpeg_data)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.get_logger().error(f"Process loop error: {e}")
+
+    def _decode_frame(self, jpeg_data: bytes) -> None:
+        """Decode JPEG bytes into a BGR numpy array and cache both."""
+        np_arr = np.frombuffer(jpeg_data, dtype=np.uint8)
+        frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            return
 
         with self._frame_lock:
             self._frame = frame_bgr
-            if success:
-                self._frame_jpeg = jpeg_data.tobytes()
+            self._frame_jpeg = jpeg_data
 
         self._recv_count += 1
         if self._recv_count % 50 == 0:
+            h, w = frame_bgr.shape[:2]
             self.get_logger().info(
-                f"Received {self._recv_count} frames ({msg.width}x{msg.height})"
+                f"Received {self._recv_count} Zivid frames ({w}x{h})"
             )
 
-    def _on_point_cloud(self, msg: PointCloud2) -> None:
-        """Parse PointCloud2 into a Nx6 float32 array (X, Y, Z, R, G, B)."""
-        # Find byte offsets for x, y, z, rgb fields
-        offsets = {f.name: f.offset for f in msg.fields}
-        x_off = offsets.get("x", 0)
-        y_off = offsets.get("y", 4)
-        z_off = offsets.get("z", 8)
-        rgb_off = offsets.get("rgb", 12)
-
-        step = msg.point_step
-        data = msg.data
-        rows = []
-
-        for i in range(msg.width * msg.height):
-            base = i * step
-            (x,) = struct.unpack_from("f", data, base + x_off)
-            (y,) = struct.unpack_from("f", data, base + y_off)
-            (z,) = struct.unpack_from("f", data, base + z_off)
-            if np.isnan(x) or np.isnan(y) or np.isnan(z):
-                continue
-            (rgb_packed,) = struct.unpack_from("f", data, base + rgb_off)
-            r, g, b = self._unpack_rgb(rgb_packed)
-            rows.append((x, y, z, r, g, b))
-
-        if not rows:
-            return
-
-        with self._pc_lock:
-            self._point_cloud = np.array(rows, dtype=np.float32)
-
-    @staticmethod
-    def _unpack_rgb(packed: float) -> tuple[int, int, int]:
-        """Unpack float-encoded RGB from PointCloud2."""
-        rgb_int = int(packed)
-        r = (rgb_int >> 16) & 0xFF
-        g = (rgb_int >> 8) & 0xFF
-        b = rgb_int & 0xFF
-        return r, g, b
-
     # ------------------------------------------------------------------
-    # Public accessors (thread-safe)
+    # Public accessors (thread-safe) — same interface as CameraNode
     # ------------------------------------------------------------------
 
     def get_latest_frame(self) -> Optional[np.ndarray]:
@@ -141,27 +159,10 @@ class ZividNode(Node):
                 return None
             return self._frame.copy()
 
-    def get_frame_jpeg(self, quality: int = 80) -> Optional[bytes]:
+    def get_frame_jpeg(self) -> Optional[bytes]:
         """Return the latest frame as cached JPEG bytes."""
         with self._frame_lock:
             return self._frame_jpeg
-
-    def get_point_cloud(self) -> Optional[np.ndarray]:
-        """
-        Return the latest point cloud as a Nx6 float32 array.
-        Columns: X (m), Y (m), Z (m), R, G, B
-        """
-        with self._pc_lock:
-            if self._point_cloud is None:
-                return None
-            return self._point_cloud.copy()
-
-    def get_xyz(self) -> Optional[np.ndarray]:
-        """Return only XYZ coordinates as a Nx3 float32 array (metres)."""
-        with self._pc_lock:
-            if self._point_cloud is None:
-                return None
-            return self._point_cloud[:, :3].copy()
 
     def get_frame_dimensions(self) -> Optional[tuple[int, int]]:
         """Return (width, height) of the color frame."""
@@ -176,7 +177,10 @@ class ZividNode(Node):
         with self._frame_lock:
             return self._frame is not None
 
-    def has_point_cloud(self) -> bool:
-        """True if at least one point cloud has been received."""
-        with self._pc_lock:
-            return self._point_cloud is not None
+    def is_connected(self) -> bool:
+        """True if connected to the Zivid WebSocket server."""
+        return self._connected
+
+    def destroy_node(self) -> None:
+        self._running = False
+        super().destroy_node()

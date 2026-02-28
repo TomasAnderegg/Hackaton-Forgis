@@ -62,12 +62,13 @@ def main():
     camera_type = os.environ.get("CAMERA_TYPE", "realsense").lower()
     if camera_type == "zivid":
         camera = ZividNode()
-        logger.info("Using Zivid camera")
+        camera_bridge = None
+        logger.info("Using Zivid camera (no RealSense bridge needed)")
     else:
         camera = CameraNode()
+        camera_bridge = CameraBridgeNode()
         logger.info("Using RealSense camera")
 
-    camera_bridge = CameraBridgeNode()
     hand = CovviHandNode()
 
     # WebSocket manager for real-time events
@@ -100,7 +101,8 @@ def main():
     ros_executor = MultiThreadedExecutor()
     ros_executor.add_node(robot)
     ros_executor.add_node(camera)
-    ros_executor.add_node(camera_bridge)
+    if camera_bridge is not None:
+        ros_executor.add_node(camera_bridge)
     ros_executor.add_node(hand)
     # Run ROS 2 executor in background thread
     ros_thread = threading.Thread(target=run_ros_executor, args=(ros_executor,), daemon=True)
@@ -129,7 +131,8 @@ def main():
         ros_executor.shutdown()
         robot.destroy_node()
         camera.destroy_node()
-        camera_bridge.destroy_node()
+        if camera_bridge is not None:
+            camera_bridge.destroy_node()
         hand.destroy_node()
         rclpy.shutdown()
 

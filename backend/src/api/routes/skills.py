@@ -49,3 +49,13 @@ async def get_skill(skill_name: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Skill '{skill_name}' not found",
         )
+
+
+@router.get("/rl/qtable")
+async def get_rl_qtable():
+    """Return the current Q-learning state: Q-table, epsilon, episode count."""
+    from skills.robot.rl_pick import RLPickSkill
+    learner = RLPickSkill._learner
+    if learner is None:
+        return {"status": "not_initialized", "message": "Run dobot_rl_pick_place flow first"}
+    return {"status": "ok", **learner.get_summary()}

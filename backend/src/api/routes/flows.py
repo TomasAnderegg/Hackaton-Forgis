@@ -1,9 +1,117 @@
 """REST endpoints for flow management."""
 
+import json
 import logging
+import os
 from typing import Any, Optional
 
+from openai import AsyncAzureOpenAI
+
 logger = logging.getLogger(__name__)
+
+# ── LLM client (lazy-init, shared) ─────────────────────────────────────────
+
+_openai_client: Optional[AsyncAzureOpenAI] = None
+
+
+def _get_openai_client() -> AsyncAzureOpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = AsyncAzureOpenAI(
+            api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
+            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+            azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
+        )
+    return _openai_client
+
+
+# ── System prompt for flow generation ──────────────────────────────────────
+
+_FLOW_SYSTEM_PROMPT = """You are an expert robot automation engineer. Generate a valid JSON flow definition for a DOBOT Nova 5 industrial robot arm based on the user's natural language description.
+
+## Available Skills
+
+### Robot Skills (executor: "robot")
+- **move_joint** — Move robot to joint positions
+  params: {"target_joints_deg": [j0,j1,j2,j3,j4,j5]}  or "{{variable_name}}"
+  timeout_ms: 30000
+
+- **move_linear** — Move robot TCP in Cartesian space
+  params: {"target_pose": [x_m, y_m, z_m, rx_rad, ry_rad, rz_rad]}
+  timeout_ms: 30000
+
+- **set_tool_output** — Control the pneumatic gripper (dual-solenoid)
+  Close: {"index": 1, "status": 1}
+  Open:  {"index": 2, "status": 1}
+  timeout_ms: 3000
+
+### Camera Skills (executor: "camera")
+- **get_bounding_box** — YOLO object detection
+  params: {"object_class": "box", "confidence_threshold": 0.5}
+  timeout_ms: 10000
+
+- **get_label** — GPT-4V OCR / label reading
+  params: {"prompt": "Read the label text", "use_bbox": true}
+  timeout_ms: 30000
+
+- **start_streaming** — Start live camera feed
+  params: {"fps": 15}
+
+- **stop_streaming** — Stop camera feed
+  params: {}
+
+### I/O Skills (executor: "io_robot")
+- **io_set_digital_output** — Set a digital output pin
+  params: {"pin": 4, "value": true}
+
+## Flow JSON Schema
+
+```json
+{
+  "id": "unique_snake_case_id",
+  "name": "Human Readable Name",
+  "initial_state": "first_state_name",
+  "loop": false,
+  "variables": {
+    "midair_joints": [152.345, -17.610, 87.397, 50.315, 2.243, 10.032],
+    "pick_joints":   [152.345, -32.610, 72.397, 50.315, 2.243, 10.032],
+    "place_joints":  [80.000,  -25.000, 80.000, 45.000, 2.000, 10.000]
+  },
+  "states": [
+    {
+      "name": "state_name",
+      "steps": [
+        {
+          "id": "unique_step_id",
+          "skill": "skill_name",
+          "executor": "robot",
+          "params": {},
+          "timeout_ms": 30000,
+          "error_handling": {"strategy": "stop", "max_retries": 3, "retry_delay_ms": 1000}
+        }
+      ]
+    }
+  ],
+  "transitions": [
+    {"type": "sequential", "from_state": "state_a", "to_state": "state_b"}
+  ]
+}
+```
+
+## Rules
+1. Use variable references like "{{variable_name}}" for joint arrays stored in variables
+2. All step IDs must be UNIQUE across the entire flow
+3. All transition states must exist in the states list
+4. The initial_state must exist in the states list
+5. For pick & place: always add a safe midair state between pick and place
+6. Use "retry" error_handling for vision/detection steps, "stop" for motion steps
+7. Default joint placeholders (calibration needed at runtime):
+   - midair: [152.345, -17.610, 87.397, 50.315, 2.243, 10.032]
+   - pick:   [152.345, -32.610, 72.397, 50.315, 2.243, 10.032]
+   - place:  [80.000,  -25.000, 80.000, 45.000, 2.000, 10.000]
+8. Generate a unique id using lowercase letters, digits and underscores only
+
+Return ONLY the raw JSON object. No markdown fences, no explanation, no extra text."""
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
@@ -358,28 +466,75 @@ async def resume_flow():
     return FlowResumeResponse(success=True, message=message)
 
 
-# Default flow loaded when no AI generation is implemented.
-# Hackathon challenge: replace this endpoint with real LLM-based flow generation.
+# Fallback flow when LLM generation fails.
 _DEFAULT_FLOW_ID = "dobot_test_pick"
 
 
 @router.post("/generate", response_model=FlowGenerateResponse)
 async def generate_flow(request: FlowGenerateRequest):
     """
-    Load and return the default flow definition.
+    Generate a robot flow from a natural language prompt using Azure OpenAI.
 
-    TODO (hackathon): Implement AI-based flow generation from the natural
-    language prompt in `request.prompt`. The response must conform to
-    FlowGenerateResponse (nodes + edges in frontend format).
+    Calls gpt-4o with a structured system prompt describing all available
+    skills and the flow JSON schema. Falls back to the default flow if the
+    LLM call or validation fails.
     """
-    logger.debug("generate_flow called with prompt: %r", request.prompt)
+    logger.info("generate_flow called with prompt: %r", request.prompt)
     manager = get_manager()
 
+    azure_key = os.environ.get("AZURE_OPENAI_API_KEY", "")
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+    if azure_key and azure_endpoint:
+        try:
+            client = _get_openai_client()
+            deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+
+            response = await client.chat.completions.create(
+                model=deployment,
+                messages=[
+                    {"role": "system", "content": _FLOW_SYSTEM_PROMPT},
+                    {"role": "user", "content": request.prompt},
+                ],
+                response_format={"type": "json_object"},
+                max_completion_tokens=4096,
+                temperature=0.2,
+            )
+
+            raw = response.choices[0].message.content or ""
+            logger.info("LLM raw response (first 300 chars): %s", raw[:300])
+
+            flow_data = json.loads(raw)
+            flow = FlowSchema(**flow_data)
+
+            valid, err = flow.validate_flow()
+            if not valid:
+                logger.error("LLM flow validation failed: %s — raw: %s", err, raw[:500])
+                raise ValueError(err)
+
+            # Persist so the user can start it immediately
+            manager.save_flow(flow)
+            logger.info("LLM-generated flow saved: %s", flow.id)
+
+            return convert_backend_to_frontend(flow)
+
+        except Exception as exc:
+            logger.warning(
+                "Flow generation failed (%s: %s) — falling back to default flow",
+                type(exc).__name__, exc,
+            )
+
+    else:
+        logger.warning(
+            "AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT not set — "
+            "falling back to default flow '%s'",
+            _DEFAULT_FLOW_ID,
+        )
+
+    # Fallback: return the hardcoded default flow
     flow = manager.get_flow(_DEFAULT_FLOW_ID)
     if flow is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Default flow '{_DEFAULT_FLOW_ID}' not found",
         )
-
     return convert_backend_to_frontend(flow)
