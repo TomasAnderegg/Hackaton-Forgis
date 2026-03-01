@@ -13,10 +13,10 @@ from executors import IOExecutor, RobotExecutor, CameraExecutor, HandExecutor, D
 from flow.manager import FlowManager
 from nodes.ur_node import RobotNode
 from nodes.dobot_nova5_node import DobotNova5Node
-from nodes.camera_node import CameraNode
+# from nodes.camera_node import CameraNode
 from nodes.zivid_node import ZividNode
 from nodes.camera_bridge_node import CameraBridgeNode
-from nodes.covvi_hand_node import CovviHandNode
+# from nodes.covvi_hand_node import CovviHandNode
 # Import skills to register them
 import skills.robot  # noqa: F401
 import skills.io  # noqa: F401
@@ -65,23 +65,23 @@ def main():
         camera_bridge = None
         logger.info("Using Zivid camera (no RealSense bridge needed)")
     else:
-        camera = CameraNode()
+        # camera = CameraNode()
         camera_bridge = CameraBridgeNode()
         logger.info("Using RealSense camera")
 
-    hand = CovviHandNode()
+    # hand = CovviHandNode()
 
     # WebSocket manager for real-time events
     ws_manager = WebSocketManager()
 
     # Camera and hand executors (always present)
     camera_executor = CameraExecutor(camera, ws_manager)
-    hand_executor = HandExecutor(hand)
+    # hand_executor = HandExecutor(hand)
 
     executors = {
         "robot": robot_executor,
         "camera": camera_executor,
-        "hand": hand_executor,
+        # "hand": hand_executor,
     }
     if io_robot_executor is not None:
         executors["io_robot"] = io_robot_executor
@@ -95,7 +95,7 @@ def main():
     )
 
     # FastAPI application
-    app = create_app(flow_manager, ws_manager, robot, camera_executor, io_robot_executor, hand_executor)
+    app = create_app(flow_manager, ws_manager, robot, camera_executor, io_robot_executor)
 
     # ROS 2 executor with nodes
     ros_executor = MultiThreadedExecutor()
@@ -103,7 +103,7 @@ def main():
     ros_executor.add_node(camera)
     if camera_bridge is not None:
         ros_executor.add_node(camera_bridge)
-    ros_executor.add_node(hand)
+    # ros_executor.add_node(hand)
     # Run ROS 2 executor in background thread
     ros_thread = threading.Thread(target=run_ros_executor, args=(ros_executor,), daemon=True)
     ros_thread.start()
@@ -115,7 +115,7 @@ def main():
         if io_robot_executor is not None:
             await io_robot_executor.initialize()
         await camera_executor.initialize()
-        await hand_executor.initialize()
+        # await hand_executor.initialize()
 
     asyncio.get_event_loop().run_until_complete(init_executors())
     logger.info("Executors initialized")
@@ -133,7 +133,7 @@ def main():
         camera.destroy_node()
         if camera_bridge is not None:
             camera_bridge.destroy_node()
-        hand.destroy_node()
+        # hand.destroy_node()
         rclpy.shutdown()
 
 

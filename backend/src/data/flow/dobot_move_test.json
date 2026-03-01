@@ -1,0 +1,25 @@
+{
+  "id": "dobot_move_test",
+  "name": "DOBOT Move Test",
+  "initial_state": "move",
+  "loop": false,
+  "variables": {},
+  "states": [
+    {
+      "name": "move",
+      "steps": [
+        {
+          "id": "step_move",
+          "skill": "move_joint",
+          "executor": "robot",
+          "params": {
+            "target_joints_deg": [0, 0, 90, 0, 90, 0]
+          },
+          "timeout_ms": 30000,
+          "error_handling": { "strategy": "stop" }
+        }
+      ]
+    }
+  ],
+  "transitions": []
+}
