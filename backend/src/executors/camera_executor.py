@@ -353,7 +353,7 @@ class CameraExecutor(Executor):
 
         while self._streaming:
             try:
-                frame_jpeg = self._camera.get_frame_jpeg(quality=70)
+                frame_jpeg = self._camera.get_frame_jpeg()
                 if frame_jpeg and self._frame_queue:
                     dims = self._camera.get_frame_dimensions()
                     width, height = dims if dims else (640, 480)

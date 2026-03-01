@@ -12,6 +12,8 @@ services:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
     env_file: .env
     command: bash scripts/start_driver.sh
+    volumes:
+      - ./assets/urdriver/rtde_input_recipe.txt:/opt/ros/humble/share/ur_robot_driver/resources/rtde_input_recipe.txt
     restart: unless-stopped
 
 

@@ -44,28 +44,18 @@ class ZividCapture:
             self._app = zivid.Application()
 
             if self.ip:
-                logger.info(f"Connecting to Zivid camera at IP {self.ip}...")
-                # Try different SDK versions' IP-connect APIs
-                try:
-                    self._camera = self._app.connect_camera(
-                        zivid.CameraInfo.Network.IPAddress(self.ip)
-                    )
-                except AttributeError:
-                    self._camera = self._app.connect_camera(
-                        zivid.NetworkCamera(self.ip)
-                    )
-            else:
-                cameras = self._app.cameras()
-                if not cameras:
-                    logger.error("No Zivid cameras found")
-                    return False
-                for cam in cameras:
-                    logger.info(
-                        f"  Found: {cam.info.serial_number} | "
-                        f"{cam.info.model_name} | "
-                        f"status={cam.state.status}"
-                    )
-                self._camera = self._app.connect_camera()
+                logger.info(f"Looking for Zivid camera (hint IP: {self.ip})...")
+            cameras = self._app.cameras()
+            if not cameras:
+                logger.error("No Zivid cameras found")
+                return False
+            for cam in cameras:
+                logger.info(
+                    f"  Found: {cam.info.serial_number} | "
+                    f"{cam.info.model_name} | "
+                    f"status={cam.state.status}"
+                )
+            self._camera = self._app.connect_camera()
 
             logger.info(
                 f"Zivid camera connected: {self._camera.info.model_name} "

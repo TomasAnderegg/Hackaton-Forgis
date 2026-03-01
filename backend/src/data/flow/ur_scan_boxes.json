@@ -1,0 +1,61 @@
+{
+  "id": "ur_scan_boxes",
+  "name": "UR — Scan & Hover above boxes",
+  "initial_state": "scan",
+  "loop": false,
+  "variables": {
+    "midair_joints": [0.0, -90.0, 90.0, -90.0, -90.0, 0.0],
+    "z_height_m": 0.20,
+    "hover_time_s": 1.5
+  },
+  "states": [
+    {
+      "name": "midair",
+      "steps": [
+        {
+          "id": "go_safe",
+          "skill": "move_joint",
+          "executor": "robot",
+          "params": { "target_joints_deg": "{{90}}" },
+          "timeout_ms": 30000
+        }
+      ]
+    },
+    {
+      "name": "scan",
+      "steps": [
+        {
+          "id": "scan_and_hover_boxes",
+          "skill": "scan_and_hover",
+          "executor": "robot",
+          "params": {
+            "object_class": "cardboard box",
+            "confidence_threshold": 0.3,
+            "z_height_m": "{{0.10}}",
+            "orientation": [3.14159, 0.0, 0.0],
+            "hover_time_s": "{{hover_time_s}}",
+            "velocity": 0.15,
+            "acceleration": 0.3
+          },
+          "timeout_ms": 120000
+        }
+      ]
+    },
+    {
+      "name": "return_midair",
+      "steps": [
+        {
+          "id": "return_safe",
+          "skill": "move_joint",
+          "executor": "robot",
+          "params": { "target_joints_deg": "{{90}}" },
+          "timeout_ms": 30000
+        }
+      ]
+    }
+  ],
+  "transitions": [
+    { "type": "sequential", "from_state": "midair",        "to_state": "scan" },
+    { "type": "sequential", "from_state": "scan",          "to_state": "return_midair" }
+  ]
+}
