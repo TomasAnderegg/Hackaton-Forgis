@@ -12,6 +12,7 @@ import numpy as np
 from openai import AsyncAzureOpenAI
 
 from .base import Executor
+from .camera_calibration import CameraCalibration
 
 if TYPE_CHECKING:
     from api.websocket import WebSocketManager
@@ -30,16 +31,24 @@ class BoundingBox:
     height: float
     confidence: float
     class_name: str
+    robot_x: Optional[float] = None  # Robot frame X (mm) after calibration
+    robot_y: Optional[float] = None  # Robot frame Y (mm) after calibration
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "x": self.x,
             "y": self.y,
             "width": self.width,
             "height": self.height,
             "confidence": self.confidence,
             "class_name": self.class_name,
+            "center_x": self.x + self.width / 2,
+            "center_y": self.y + self.height / 2,
         }
+        if self.robot_x is not None:
+            d["robot_x"] = self.robot_x
+            d["robot_y"] = self.robot_y
+        return d
 
 
 class CameraExecutor(Executor):
@@ -68,6 +77,13 @@ class CameraExecutor(Executor):
         # Azure OpenAI client (lazy loaded)
         self._openai_client: Optional[AsyncAzureOpenAI] = None
         self._azure_deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+
+        # Gemini model (lazy loaded)
+        self._gemini_model = None
+        self._gemini_model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
+        # Camera-to-robot calibration (loaded from file if exists)
+        self.calibration = CameraCalibration()
 
         # Last detection result for cropping
         self._last_bbox: Optional[BoundingBox] = None
@@ -123,6 +139,139 @@ class CameraExecutor(Executor):
                 azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
             )
         return self._openai_client
+
+    def _get_gemini_model(self):
+        """Get or create a Gemini GenerativeModel instance (lazy init)."""
+        if self._gemini_model is None:
+            import google.generativeai as genai
+            api_key = os.environ.get("GEMINI_API_KEY", "")
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY is not set")
+            genai.configure(api_key=api_key)
+            self._gemini_model = genai.GenerativeModel(self._gemini_model_name)
+            logger.info("Gemini model loaded: %s", self._gemini_model_name)
+        return self._gemini_model
+
+    # ── Gemini Vision Detection ───────────────────────────────────────────
+
+    async def detect_with_gemini(
+        self,
+        object_description: str,
+        confidence_threshold: float = 0.5,
+    ) -> list[BoundingBox]:
+        """
+        Detect objects using Gemini Vision (zero-shot, natural language).
+
+        Unlike YOLO, no predefined class name is required — describe the object
+        in plain English (e.g. "the brown cardboard box", "the red bottle").
+
+        Gemini returns bounding boxes normalised to 0-1000 scale which are
+        converted back to absolute pixels using the Zivid frame dimensions.
+
+        Args:
+            object_description: Natural language description of the target object.
+            confidence_threshold: Minimum Gemini-reported confidence to accept.
+
+        Returns:
+            List of BoundingBox objects in the same format as detect_objects (YOLO).
+        """
+        import json as _json
+
+        frame = self._camera.get_latest_frame()
+        if frame is None:
+            logger.warning("Gemini detect: no frame available")
+            return []
+
+        # Encode the Zivid BGR frame as JPEG
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 90]
+        ok, encoded = cv2.imencode(".jpg", frame, encode_params)
+        if not ok:
+            logger.error("Gemini detect: JPEG encoding failed")
+            return []
+        image_bytes = encoded.tobytes()
+
+        # Frame dimensions for denormalisation (Zivid 2+ MR130 → 1920×1200)
+        dims = self._camera.get_frame_dimensions()
+        frame_w, frame_h = dims if dims else (1920, 1200)
+
+        prompt = (
+            f'Detect all instances of "{object_description}" in this image. '
+            "Return a JSON array. Each element must have exactly these keys: "
+            '"y1" (int 0-1000), "x1" (int 0-1000), "y2" (int 0-1000), "x2" (int 0-1000), '
+            '"confidence" (float 0.0-1.0), "label" (string). '
+            "Coordinates are normalised to 0-1000 scale, top-left origin. "
+            "If the object is not present return an empty array []. "
+            "Return ONLY the raw JSON array — no markdown, no explanation."
+        )
+
+        try:
+            model = self._get_gemini_model()
+            response = await asyncio.wait_for(
+                model.generate_content_async(
+                    [
+                        prompt,
+                        {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()},
+                    ]
+                ),
+                timeout=30.0,
+            )
+
+            raw = response.text.strip()
+            logger.debug("Gemini raw response: %s", raw[:300])
+
+            # Strip markdown code fences if the model adds them
+            if "```" in raw:
+                for block in raw.split("```"):
+                    block = block.strip().lstrip("json").strip()
+                    if block.startswith("["):
+                        raw = block
+                        break
+
+            boxes_raw = _json.loads(raw)
+            if not isinstance(boxes_raw, list):
+                boxes_raw = [boxes_raw]
+
+            detections: list[BoundingBox] = []
+            for box in boxes_raw:
+                conf = float(box.get("confidence", 1.0))
+                if conf < confidence_threshold:
+                    continue
+
+                # Denormalise from 0-1000 to absolute pixels
+                x1_px = (box["x1"] / 1000.0) * frame_w
+                y1_px = (box["y1"] / 1000.0) * frame_h
+                x2_px = (box["x2"] / 1000.0) * frame_w
+                y2_px = (box["y2"] / 1000.0) * frame_h
+
+                detections.append(BoundingBox(
+                    x=x1_px,
+                    y=y1_px,
+                    width=max(1.0, x2_px - x1_px),
+                    height=max(1.0, y2_px - y1_px),
+                    confidence=conf,
+                    class_name=box.get("label", object_description),
+                ))
+
+            # Store and broadcast best detection (same behaviour as YOLO path)
+            if detections:
+                self._last_bbox = detections[0]
+                await self._broadcast_bbox(detections[0])
+
+            logger.info(
+                "Gemini detect: %d detection(s) for '%s' (frame %dx%d)",
+                len(detections), object_description, frame_w, frame_h,
+            )
+            return detections
+
+        except asyncio.TimeoutError:
+            logger.error("Gemini detect: timeout after 30s")
+            return []
+        except _json.JSONDecodeError as e:
+            logger.error("Gemini detect: JSON parse error — %s | raw: %s", e, raw[:200])
+            return []
+        except Exception as e:
+            logger.error("Gemini detect: unexpected error — %s", e)
+            return []
 
     async def _warmup_openai(self) -> None:
         """Send a minimal request to establish the HTTP/TLS connection pool.
@@ -255,7 +404,7 @@ class CameraExecutor(Executor):
     async def detect_objects(
         self,
         class_name: Optional[str] = None,
-        confidence_threshold: float = 0.5,
+        confidence_threshold: float = 0.02,
     ) -> list[BoundingBox]:
         """
         Run YOLO object detection on current frame.
@@ -274,11 +423,10 @@ class CameraExecutor(Executor):
 
         logger.info(f"detect_objects: frame shape={frame.shape}, looking for class='{class_name}' conf>={confidence_threshold}")
 
-        # Run detection on full frame
         loop = asyncio.get_event_loop()
         results = await loop.run_in_executor(
             None,
-            lambda: self._get_yolo_model()(frame, verbose=False),
+            lambda: self._get_yolo_model()(frame, verbose=False, conf=0.01),
         )
 
         detections: list[BoundingBox] = []
@@ -303,15 +451,22 @@ class CameraExecutor(Executor):
                     logger.info(f"detect_objects: SKIPPED (class '{cls_name}' != '{class_name}')")
                     continue
 
+                # Apply camera-to-robot calibration if available
+                robot_x, robot_y = None, None
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                if self.calibration.is_calibrated():
+                    try:
+                        robot_x, robot_y = self.calibration.pixel_to_robot(cx, cy)
+                    except Exception as e:
+                        logger.warning(f"Calibration transform failed: {e}")
+
                 bbox = BoundingBox(
-                    x=x1,
-                    y=y1,
-                    width=x2 - x1,
-                    height=y2 - y1,
-                    confidence=conf,
-                    class_name=cls_name,
+                    x=x1, y=y1,
+                    width=x2 - x1, height=y2 - y1,
+                    confidence=conf, class_name=cls_name,
+                    robot_x=robot_x, robot_y=robot_y,
                 )
-                logger.info(f"detect_objects: ACCEPTED bbox x={bbox.x:.1f} y={bbox.y:.1f} w={bbox.width:.1f} h={bbox.height:.1f}")
+                logger.info(f"detect_objects: ACCEPTED bbox center=({cx:.0f},{cy:.0f}) robot=({robot_x},{robot_y})")
                 detections.append(bbox)
 
         # Store last detection for potential cropping
@@ -551,7 +706,18 @@ class CameraExecutor(Executor):
 
     def get_snapshot_jpeg(self, quality: int = 90) -> Optional[bytes]:
         """Get current frame as JPEG for REST endpoint."""
-        return self._camera.get_frame_jpeg(quality=quality)
+        # Re-encode from the BGR frame at the requested quality.
+        # ZividNode caches the raw JPEG from the server (fixed quality),
+        # so we re-encode from the decoded BGR array to honor the quality param.
+        frame = self._camera.get_latest_frame()
+        if frame is not None:
+            encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+            ok, buf = cv2.imencode(".jpg", frame, encode_params)
+            if ok:
+                return buf.tobytes()
+        # Fallback: return cached JPEG (may not exist on all camera types)
+        get_jpeg = getattr(self._camera, "get_frame_jpeg", None)
+        return get_jpeg() if get_jpeg else None
 
     def get_state_summary(self) -> dict:
         """Get camera state summary."""

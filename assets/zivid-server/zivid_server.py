@@ -80,7 +80,7 @@ class ZividCapture:
                     aperture=2.83,
                     exposure_time=datetime.timedelta(microseconds=10000),
                     brightness=1.0,
-                    gain=2.0,
+                    gain=3.0,
                 )]
             )
             return True

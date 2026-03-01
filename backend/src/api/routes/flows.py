@@ -470,67 +470,97 @@ async def resume_flow():
 _DEFAULT_FLOW_ID = "dobot_test_pick"
 
 
+def _parse_and_validate_flow(raw: str, manager) -> "FlowSchema":
+    """Parse raw LLM JSON, validate against FlowSchema, save and return."""
+    # Strip markdown code fences some models add
+    if "```" in raw:
+        for block in raw.split("```"):
+            block = block.strip().lstrip("json").strip()
+            if block.startswith("{"):
+                raw = block
+                break
+
+    flow_data = json.loads(raw)
+    flow = FlowSchema(**flow_data)
+    valid, err = flow.validate_flow()
+    if not valid:
+        raise ValueError(f"Flow validation failed: {err}")
+    manager.save_flow(flow)
+    logger.info("LLM-generated flow saved: %s", flow.id)
+    return flow
+
+
+async def _generate_with_azure(prompt: str) -> str:
+    """Call Azure OpenAI and return raw JSON string."""
+    client = _get_openai_client()
+    deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+    response = await client.chat.completions.create(
+        model=deployment,
+        messages=[
+            {"role": "system", "content": _FLOW_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+        max_completion_tokens=4096,
+        temperature=0.2,
+    )
+    return response.choices[0].message.content or ""
+
+
+async def _generate_with_gemini(prompt: str) -> str:
+    """Call Gemini and return raw JSON string."""
+    import google.generativeai as genai
+
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+
+    full_prompt = _FLOW_SYSTEM_PROMPT + "\n\nUser request: " + prompt
+    response = await model.generate_content_async(full_prompt)
+    return response.text or ""
+
+
 @router.post("/generate", response_model=FlowGenerateResponse)
 async def generate_flow(request: FlowGenerateRequest):
     """
-    Generate a robot flow from a natural language prompt using Azure OpenAI.
+    Generate a robot flow from a natural language prompt.
 
-    Calls gpt-4o with a structured system prompt describing all available
-    skills and the flow JSON schema. Falls back to the default flow if the
-    LLM call or validation fails.
+    Tries LLM providers in order:
+      1. Azure OpenAI  (if AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT are set)
+      2. Gemini        (if GEMINI_API_KEY is set)
+      3. Default flow  (fallback)
     """
     logger.info("generate_flow called with prompt: %r", request.prompt)
     manager = get_manager()
 
     azure_key = os.environ.get("AZURE_OPENAI_API_KEY", "")
     azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
-    if azure_key and azure_endpoint:
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+
+    # ── 1. Try Azure OpenAI ─────────────────────────────────────────────────
+    if azure_key and azure_endpoint and not azure_key.startswith("<"):
         try:
-            client = _get_openai_client()
-            deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-
-            response = await client.chat.completions.create(
-                model=deployment,
-                messages=[
-                    {"role": "system", "content": _FLOW_SYSTEM_PROMPT},
-                    {"role": "user", "content": request.prompt},
-                ],
-                response_format={"type": "json_object"},
-                max_completion_tokens=4096,
-                temperature=0.2,
-            )
-
-            raw = response.choices[0].message.content or ""
-            logger.info("LLM raw response (first 300 chars): %s", raw[:300])
-
-            flow_data = json.loads(raw)
-            flow = FlowSchema(**flow_data)
-
-            valid, err = flow.validate_flow()
-            if not valid:
-                logger.error("LLM flow validation failed: %s — raw: %s", err, raw[:500])
-                raise ValueError(err)
-
-            # Persist so the user can start it immediately
-            manager.save_flow(flow)
-            logger.info("LLM-generated flow saved: %s", flow.id)
-
+            raw = await _generate_with_azure(request.prompt)
+            logger.info("Azure response (first 300 chars): %s", raw[:300])
+            flow = _parse_and_validate_flow(raw, manager)
             return convert_backend_to_frontend(flow)
-
         except Exception as exc:
-            logger.warning(
-                "Flow generation failed (%s: %s) — falling back to default flow",
-                type(exc).__name__, exc,
-            )
+            logger.warning("Azure generation failed (%s: %s) — trying Gemini", type(exc).__name__, exc)
 
+    # ── 2. Try Gemini ───────────────────────────────────────────────────────
+    if gemini_key and not gemini_key.startswith("<"):
+        try:
+            raw = await _generate_with_gemini(request.prompt)
+            logger.info("Gemini response (first 300 chars): %s", raw[:300])
+            flow = _parse_and_validate_flow(raw, manager)
+            return convert_backend_to_frontend(flow)
+        except Exception as exc:
+            logger.warning("Gemini generation failed (%s: %s) — using default flow", type(exc).__name__, exc)
     else:
-        logger.warning(
-            "AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT not set — "
-            "falling back to default flow '%s'",
-            _DEFAULT_FLOW_ID,
-        )
+        logger.warning("No LLM credentials configured — using default flow '%s'", _DEFAULT_FLOW_ID)
 
-    # Fallback: return the hardcoded default flow
+    # ── 3. Fallback ─────────────────────────────────────────────────────────
     flow = manager.get_flow(_DEFAULT_FLOW_ID)
     if flow is None:
         raise HTTPException(

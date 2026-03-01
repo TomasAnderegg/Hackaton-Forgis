@@ -1,0 +1,134 @@
+{
+  "id": "dobot_rl_pick_gemini",
+  "name": "DOBOT RL Pick & Place — Gemini Vision",
+  "initial_state": "scan",
+  "loop": true,
+  "variables": {
+    "midair_joints":    [152.345, -17.610, 87.397, 50.315, 2.243, 10.032],
+    "base_pick_joints": [152.345, -32.610, 72.397, 50.315, 2.243, 10.032],
+    "place_joints":     [80.000,  -25.000, 80.000, 45.000, 2.000, 10.000]
+  },
+  "states": [
+
+    {
+      "name": "scan",
+      "steps": [
+        {
+          "id": "detect_object_gemini",
+          "skill": "get_bounding_box_gemini",
+          "executor": "camera",
+          "params": {
+            "object_description": "rectangular white, gray and a green cardboard box on the table",
+            "confidence_threshold": 0.5
+          },
+          "store_result": "detection",
+          "timeout_ms": 30000,
+          "error_handling": { "strategy": "retry", "max_retries": 3, "retry_delay_ms": 2000 }
+        }
+      ]
+    },
+
+    {
+      "name": "midair",
+      "steps": [
+        {
+          "id": "go_midair",
+          "skill": "move_joint",
+          "executor": "robot",
+          "params": { "target_joints_deg": "{{midair_joints}}" },
+          "timeout_ms": 30000,
+          "error_handling": { "strategy": "stop" }
+        }
+      ]
+    },
+
+    {
+      "name": "rl_pick",
+      "steps": [
+        {
+          "id": "open_gripper_before",
+          "skill": "set_tool_output",
+          "executor": "robot",
+          "params": { "index": 2, "status": 1 },
+          "timeout_ms": 3000,
+          "error_handling": { "strategy": "stop" }
+        },
+        {
+          "id": "rl_move_to_pick",
+          "skill": "rl_pick",
+          "executor": "robot",
+          "params": {
+            "base_pick_joints": "{{base_pick_joints}}",
+            "frame_width": 1920.0,
+            "frame_height": 1200.0
+          },
+          "timeout_ms": 30000,
+          "error_handling": { "strategy": "stop" }
+        },
+        {
+          "id": "close_gripper",
+          "skill": "set_tool_output",
+          "executor": "robot",
+          "params": { "index": 1, "status": 1 },
+          "timeout_ms": 3000,
+          "error_handling": { "strategy": "stop" }
+        },
+        {
+          "id": "rl_feedback",
+          "skill": "rl_update",
+          "executor": "camera",
+          "params": {
+            "strategy": "camera",
+            "object_class": "cardboard box on the table",
+            "confidence_threshold": 0.4
+          },
+          "timeout_ms": 30000,
+          "error_handling": { "strategy": "skip" }
+        }
+      ]
+    },
+
+    {
+      "name": "return_midair",
+      "steps": [
+        {
+          "id": "go_midair_return",
+          "skill": "move_joint",
+          "executor": "robot",
+          "params": { "target_joints_deg": "{{midair_joints}}" },
+          "timeout_ms": 30000,
+          "error_handling": { "strategy": "stop" }
+        }
+      ]
+    },
+
+    {
+      "name": "place",
+      "steps": [
+        {
+          "id": "move_to_place",
+          "skill": "move_joint",
+          "executor": "robot",
+          "params": { "target_joints_deg": "{{place_joints}}" },
+          "timeout_ms": 30000,
+          "error_handling": { "strategy": "stop" }
+        },
+        {
+          "id": "open_gripper_place",
+          "skill": "set_tool_output",
+          "executor": "robot",
+          "params": { "index": 2, "status": 1 },
+          "timeout_ms": 3000,
+          "error_handling": { "strategy": "stop" }
+        }
+      ]
+    }
+
+  ],
+  "transitions": [
+    { "type": "sequential", "from_state": "scan",          "to_state": "midair" },
+    { "type": "sequential", "from_state": "midair",        "to_state": "rl_pick" },
+    { "type": "sequential", "from_state": "rl_pick",       "to_state": "return_midair" },
+    { "type": "sequential", "from_state": "return_midair", "to_state": "place" }
+  ]
+}
